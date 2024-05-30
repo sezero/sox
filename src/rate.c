@@ -213,7 +213,7 @@ static void dft_stage_fn(stage_t * p, fifo_t * output_fifo)
   }
 }
 
-static void dft_stage_init(
+static int dft_stage_init(
     unsigned instance, double Fp, double Fs, double Fn, double att,
     double phase, stage_t * stage, int L, int M)
 {
@@ -229,6 +229,12 @@ static void dft_stage_init(
     else f->post_peak = num_taps / 2;
 
     dft_length = lsx_set_dft_length(num_taps);
+
+    if (L > dft_length) {
+      lsx_fail("invalid DFT parameters");
+      return SOX_EINVAL;
+    }
+
     f->coefs = calloc(dft_length, sizeof(*f->coefs));
     for (i = 0; i < num_taps; ++i)
       f->coefs[(i + dft_length - num_taps + 1) & (dft_length - 1)]
@@ -246,6 +252,8 @@ static void dft_stage_init(
   stage->L = L;
   stage->step.parts.integer = abs(3-M) == 1 && Fs == 1? -M/2 : M;
   stage->dft_filter_num = instance;
+
+  return SOX_SUCCESS;
 }
 
 #include "rate_filters.h"
@@ -271,7 +279,7 @@ typedef enum {
   rolloff_none, rolloff_small /* <= 0.01 dB */, rolloff_medium /* <= 0.35 dB */
 } rolloff_t;
 
-static void rate_init(
+static int rate_init(
   /* Private work areas (to be supplied by the client):                       */
   rate_t * p,                /* Per audio channel.                            */
   rate_shared_t * shared,    /* Between channels (undergoing same rate change)*/
@@ -299,6 +307,7 @@ static void rate_init(
   int mode = rolloff > rolloff_small? factor > 1 || bw_pc > LOW_Q_BW0_PC :
     ceil(2 + (bits - 17) / 4);
   stage_t * s;
+  int err;
 
   assert(factor > 0);
   assert(!bits || (15 <= bits && bits <= 33));
@@ -329,6 +338,7 @@ static void rate_init(
     L = preL * arbL, M = arbM * postM, x = (L|M)&1, L >>= !x, M >>= !x;
     if (iOpt && postL == 1 && (d = preL * arbL / arbM) > 4 && d != 5) {
       for (postL = 4, i = d / 16; i >>= 1; postL <<= 1);
+      lsx_debug("postL=%d", postL);
       arbM = arbM * postL / arbL / preL, arbL = 1, n = 0;
     } else if (rational && (max(L, M) < 3 + 2 * iOpt || L * M < 6 * iOpt))
       preL = L, preM = M, arbM = arbL = postM = 1;
@@ -339,7 +349,7 @@ static void rate_init(
   p->num_stages = shift + have_pre_stage + have_arb_stage + have_post_stage;
 
   if (!p->num_stages)
-    return;
+    return SOX_SUCCESS;
 
   p->stages = calloc(p->num_stages + 1, sizeof(*p->stages));
   for (i = 0; i < p->num_stages; ++i)
@@ -368,8 +378,11 @@ static void rate_init(
         lsx_debug("x=%g tbw_tighten=%g", x, tbw_tighten);
       }
     }
-    dft_stage_init(0, 1 - tbw0 * tbw_tighten, Fs_a, preM? max(preL, preM) :
-        arbM / arbL, att, phase, &pre_stage, preL, max(preM, 1));
+    err = dft_stage_init(0, 1 - tbw0 * tbw_tighten, Fs_a,
+        preM ? max(preL, preM) : arbM / arbL,
+        att, phase, &pre_stage, preL, max(preM, 1));
+    if (err)
+      return err;
   }
 
   if (!bits) {                                  /* Quick and dirty arb stage: */
@@ -443,10 +456,13 @@ static void rate_init(
     }
   }
 
-  if (have_post_stage)
-    dft_stage_init(1, 1 - (1 - (1 - tbw0) *
+  if (have_post_stage) {
+    err = dft_stage_init(1, 1 - (1 - (1 - tbw0) *
         (upsample? factor * postL / postM : 1)) * tbw_tighten, Fs_a,
         (double)max(postL, postM), att, phase, &post_stage, postL, postM);
+    if (err)
+      return err;
+  }
 
   for (i = 0, s = p->stages; i < p->num_stages; ++i, ++s) {
     fifo_create(&s->fifo, (int)sizeof(sample_t));
@@ -455,6 +471,8 @@ static void rate_init(
         s->pre, s->pre_post - s->pre, s->preload, s->remL);
   }
   fifo_create(&s->fifo, (int)sizeof(sample_t));
+
+  return SOX_SUCCESS;
 }
 
 static void rate_process(rate_t * p)
@@ -629,6 +647,7 @@ static int start(sox_effect_t * effp)
 {
   priv_t * p = (priv_t *) effp->priv;
   double out_rate = p->out_rate != 0 ? p->out_rate : effp->out_signal.rate;
+  int err;
 
   if (effp->in_signal.rate == out_rate)
     return SOX_EFF_NULL;
@@ -638,9 +657,13 @@ static int start(sox_effect_t * effp)
 
   effp->out_signal.channels = effp->in_signal.channels;
   effp->out_signal.rate = out_rate;
-  rate_init(&p->rate, p->shared_ptr, effp->in_signal.rate/out_rate,p->bit_depth,
-      p->phase, p->bw_0dB_pc, p->anti_aliasing_pc, p->rolloff, !p->given_0dB_pt,
-      p->use_hi_prec_clock, p->coef_interp, p->max_coefs_size, p->noIOpt);
+  err = rate_init(&p->rate, p->shared_ptr, effp->in_signal.rate / out_rate,
+      p->bit_depth, p->phase, p->bw_0dB_pc, p->anti_aliasing_pc, p->rolloff,
+      !p->given_0dB_pt, p->use_hi_prec_clock, p->coef_interp,
+      p->max_coefs_size, p->noIOpt);
+
+  if (err)
+    return err;
 
   if (!p->rate.num_stages) {
     lsx_warn("input and output rates too close, skipping resampling");
